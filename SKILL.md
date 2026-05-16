@@ -18,7 +18,8 @@ Use this skill after installing the `nomad-travel-planner-mcp` server. It turns 
 
 The MCP server provides tools for:
 
-- browser-first flight search via browser-use/Browserbase task payloads for Google Flights/KAYAK/Skyscanner, with static/API fallback
+- browser-first flight search via browser-use/Browserbase task payloads for Google Flights/KAYAK/Skyscanner, with Firecrawl/static/API fallback
+- Firecrawl SDK/API scraping for public Tripadvisor, Nomads.com, accommodation, and flight pages before raw static HTTP fallback
 - accommodation pricing via browser-use/Browserbase on Booking/Airbnb/Hostelworld/Agoda, with Booking.com Demand API or Amadeus hotel offers as structured fallback
 - multi-source accommodation discovery via Booking.com, Airbnb, Hostelworld, Agoda/public pages, scored against user preferences
 - AgentMail-backed signup/login guidance for travel sites, including magic-link/code polling so the user does not need to manually fetch OTPs
@@ -29,7 +30,7 @@ The MCP server provides tools for:
 - full itinerary assembly with budget scoring
 - Network School vs self-assembled nomad-base comparison for longer stays, including SIN/JHB/KUL flight-gateway checks
 
-Opinionated default: browser-use/Browserbase is the primary path for dynamic flight/accommodation sites. If the MCP server cannot directly run a browser, it returns browser-first task payloads for the host agent and includes static/API fallback data where possible. Official APIs are still better for structured pricing at scale.
+Opinionated default: browser-use/Browserbase is the primary path for dynamic flight/accommodation sites. Firecrawl is the preferred public-page scrape layer when configured, because it returns cleaner LLM-ready markdown/html than raw static HTTP. If the MCP server cannot directly run a browser, it returns browser-first task payloads for the host agent and includes Firecrawl/static/API fallback data where possible. Official APIs are still better for structured pricing at scale.
 
 ## When to Use
 
@@ -98,6 +99,8 @@ Interpretation:
 - `browser_engine.browserbase_configured=true`: host/browser cloud credentials appear configured; browser task payloads can be run by the client.
 - `browser_fallback_protocol=true`: failed/low-confidence browser/static extraction returns browser-use and Browserbase task payloads.
 - `agentmail.configured=true`: signup/login flows can poll AgentMail for verification codes or magic links.
+- `firecrawl.configured=true`: public-page scraping will use Firecrawl SDK/API before brittle raw static HTTP.
+- `firecrawl.sdk_available=true`: local Python SDK is installed; otherwise the server can still use Firecrawl v2 REST when `FIRECRAWL_API_KEY` exists.
 - `network_school.comparison_tool`: `compare_network_school_vs_nomad_base` is available for checking NS against Chiang Mai/Da Nang/etc. on longer stays.
 
 Never ask the user to paste secrets into chat. Tell them to configure environment variables in their MCP client.
@@ -141,9 +144,9 @@ Use:
 
 If a leg has missing data:
 
-- flights missing → call `search_flights` with date alternatives ±3 days; prefer `browser_mode="auto"` or `browser_mode="task-only"` if the host agent will execute browser-use/Browserbase
-- stays missing → call `search_accommodations_multi_source` when the user cares about Airbnb/Booking/Hostelworld options; call `search_amadeus_hotels_by_city` or `search_booking_accommodations` for official hotel/API-only paths
-- quality unclear → first call `tripadvisor_location_search` then `tripadvisor_location_details` if API credentials exist; otherwise call `tripadvisor_public_scrape`
+- flights missing → call `search_flights` with date alternatives ±3 days; prefer `browser_mode="auto"` or `browser_mode="task-only"` if the host agent will execute browser-use/Browserbase. With `FIRECRAWL_API_KEY`, static fallback uses Firecrawl before raw HTTP.
+- stays missing → call `search_accommodations_multi_source` when the user cares about Airbnb/Booking/Hostelworld options; call `search_amadeus_hotels_by_city` or `search_booking_accommodations` for official hotel/API-only paths. With Firecrawl configured, public pages are scraped through Firecrawl first.
+- quality unclear → first call `tripadvisor_location_search` then `tripadvisor_location_details` if API credentials exist; otherwise call `tripadvisor_public_scrape`, which uses Firecrawl first when configured.
 - city lifestyle unclear → call `nomad_city_signals`
 - any scraper returns `browser_fallback` → switch to browser-use or Browserbase using the supplied fallback payload; do not invent values
 
@@ -311,6 +314,8 @@ BOOKING_API_TOKEN
 BOOKING_AFFILIATE_ID
 BOOKING_ENV=production|sandbox
 TRIPADVISOR_API_KEY
+FIRECRAWL_API_KEY
+FIRECRAWL_API_BASE=https://api.firecrawl.dev
 AGENTMAIL_API_KEY
 AGENTMAIL_INBOX_ID=agent_cortex@agentmail.to
 NOMAD_TRAVEL_BROWSER_MODE=auto|task-only|static
@@ -330,6 +335,9 @@ mcp_servers:
       BOOKING_API_TOKEN: "..."
       BOOKING_AFFILIATE_ID: "..."
       TRIPADVISOR_API_KEY: "..."
+      FIRECRAWL_API_KEY: "..."
+      AGENTMAIL_API_KEY: "..."
+      AGENTMAIL_INBOX_ID: "your-inbox@agentmail.to"
     timeout: 180
     connect_timeout: 60
 ```
@@ -349,7 +357,7 @@ mcp_servers:
    - Prefer all-in totals when APIs expose them. If unclear, add a 10-15% buffer.
 
 5. Treating Nomads.com or Tripadvisor public scraping as stable.
-   - Useful, not canonical. Selectors break, 403s happen, dynamic pages happen. Use returned browser fallback payloads when static scraping fails.
+   - Useful, not canonical. Selectors break, 403s happen, dynamic pages happen. Configure Firecrawl for cleaner LLM-ready markdown/html, then use browser fallback payloads when Firecrawl/static scraping still fails.
 
 6. Asking the user to manually fetch email codes.
    - Use AgentMail via `agentmail_latest_verification_code`. Only escalate to the human for CAPTCHA, payment, password, or explicit approval gates.

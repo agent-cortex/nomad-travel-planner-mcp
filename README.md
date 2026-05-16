@@ -9,7 +9,12 @@ Primary providers/engines:
 - Browser-use / Browserbase-style browser automation
   - Primary path for checking public flight/accommodation websites because it sees the same dynamic prices users see.
   - If `browser-use` CLI is installed, `browser_mode=auto` tries it directly.
-  - If not installed, tools return browser-first task payloads for browser-use cloud/Browserbase/native browser tools, then include static/API fallback data when possible.
+  - If not installed, tools return browser-first task payloads for browser-use cloud/Browserbase/native browser tools, then include Firecrawl/static/API fallback data when possible.
+- Firecrawl SDK/API
+  - Preferred scrape layer for public pages before raw static HTTP scraping when `FIRECRAWL_API_KEY` is configured.
+  - Used for Tripadvisor public pages, Nomads.com city pages, public accommodation pages, and public flight search pages.
+  - The server also exposes `firecrawl_scrape` for direct public URL extraction.
+  - Firecrawl MCP server can be installed separately in the host AI, but this MCP works standalone through the Firecrawl Python SDK/API.
 - AgentMail
   - Primary email strategy for signup/login verification flows.
   - The agent enters an AgentMail inbox on travel sites and polls AgentMail for magic links/codes instead of asking the user to manually read OTPs.
@@ -59,6 +64,8 @@ export BOOKING_AFFILIATE_ID="..."
 export BOOKING_ENV="production"    # production or sandbox
 
 export TRIPADVISOR_API_KEY="..."
+export FIRECRAWL_API_KEY="..."      # recommended for public-page scraping
+export FIRECRAWL_API_BASE="https://api.firecrawl.dev"
 export AGENTMAIL_API_KEY="..."      # optional but recommended for signup/login verification
 export AGENTMAIL_INBOX_ID="agent_cortex@agentmail.to"
 export NOMAD_TRAVEL_BROWSER_MODE="auto"  # auto, task-only, static/off
@@ -90,6 +97,7 @@ mcp_servers:
       BOOKING_API_TOKEN: "YOUR_BOOKING_TOKEN"
       BOOKING_AFFILIATE_ID: "YOUR_AFFILIATE_ID"
       TRIPADVISOR_API_KEY: "YOUR_TRIPADVISOR_KEY"
+      FIRECRAWL_API_KEY: "YOUR_FIRECRAWL_KEY"
       AGENTMAIL_API_KEY: "YOUR_AGENTMAIL_KEY"
       AGENTMAIL_INBOX_ID: "your-inbox@agentmail.to"
       NOMAD_TRAVEL_BROWSER_MODE: "auto"
@@ -113,6 +121,7 @@ Restart Hermes after editing config.
         "BOOKING_API_TOKEN": "YOUR_BOOKING_TOKEN",
         "BOOKING_AFFILIATE_ID": "YOUR_AFFILIATE_ID",
         "TRIPADVISOR_API_KEY": "YOUR_TRIPADVISOR_KEY",
+        "FIRECRAWL_API_KEY": "YOUR_FIRECRAWL_KEY",
         "AGENTMAIL_API_KEY": "YOUR_AGENTMAIL_KEY",
         "AGENTMAIL_INBOX_ID": "your-inbox@agentmail.to",
         "NOMAD_TRAVEL_BROWSER_MODE": "auto"
@@ -126,6 +135,12 @@ Restart Hermes after editing config.
 
 - `provider_status`
   - Shows which providers are configured, without leaking secrets.
+  - Includes Firecrawl readiness (`firecrawl.configured`, SDK availability, API base).
+
+- `firecrawl_scrape`
+  - Inputs: public URL, optional formats, main-content flag, wait time.
+  - Uses Firecrawl Python SDK when available, with Firecrawl v2 REST fallback.
+  - Returns markdown/html metadata and truncates large content for safe MCP responses.
 
 - `search_flights`
   - Inputs: origin IATA, destination IATA, departure date, optional return date, adults, currency, sources, browser_mode.
@@ -201,6 +216,7 @@ Add `booking_city_id` when you have a Booking.com city id; otherwise the tool us
 ## Provider notes from research
 
 - Browser-use/Browserbase: preferred runtime path for public flight/accommodation sites because many are dynamic and region/session-dependent.
+- Firecrawl: preferred public-page scrape layer before raw static HTTP scraping. The implementation follows Firecrawl v2 `/scrape` docs and Python quickstart from `https://docs.firecrawl.dev/llms.txt`: install `firecrawl-py`, set `FIRECRAWL_API_KEY`, scrape pages into markdown/html, and use Interact/MCP separately for richer browser actions when needed.
 - Amadeus Flight Offers Search: official REST API for live flight prices and availability; test and production environments exist. Used as structured fallback when browser/static extraction fails or when user wants API-only.
 - Amadeus Hotel Search: official REST API for hotel offers, available rooms, room details, and prices from 150k+ hotels.
 - Booking.com Demand API: official affiliate API; accommodation search/check availability endpoints require Bearer auth and `X-Affiliate-Id`.

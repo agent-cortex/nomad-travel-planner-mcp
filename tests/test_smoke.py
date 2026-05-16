@@ -7,6 +7,7 @@ from nomad_travel_mcp.server import (
     search_accommodations_multi_source,
     search_flights,
     travel_site_signup_guidance,
+    firecrawl_scrape,
     agentmail_latest_verification_code,
     compare_network_school_vs_nomad_base,
     tripadvisor_public_scrape,
@@ -25,6 +26,8 @@ def test_provider_status_shape():
     assert "hostelworld" in result["public_accommodation_sources"]
     assert "kayak" in result["public_flight_sources"]
     assert "browser_engine" in result
+    assert "firecrawl" in result
+    assert "configured" in result["firecrawl"]
     assert "network_school" in result
     assert result["network_school"]["comparison_tool"] == "compare_network_school_vs_nomad_base"
 
@@ -105,6 +108,18 @@ def test_agentmail_latest_verification_code_unconfigured_safe():
             os.environ["AGENTMAIL_API_KEY"] = old
     assert result["configured"] is False
     assert "AGENTMAIL_API_KEY" in result["error"]
+
+
+def test_firecrawl_scrape_unconfigured_safe():
+    old = os.environ.pop("FIRECRAWL_API_KEY", None)
+    try:
+        result = asyncio.run(firecrawl_scrape("https://example.com"))
+    finally:
+        if old is not None:
+            os.environ["FIRECRAWL_API_KEY"] = old
+    assert result["ok"] is False
+    assert result["engine"] == "firecrawl"
+    assert "FIRECRAWL_API_KEY" in result["error"]
 
 
 def test_network_school_comparison_task_mode():

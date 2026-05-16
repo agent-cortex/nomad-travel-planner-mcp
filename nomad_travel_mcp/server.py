@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import json
 import math
 import os
@@ -21,6 +22,7 @@ AMADEUS_PROD_BASE = "https://api.amadeus.com"
 BOOKING_PROD_BASE = "https://demandapi.booking.com/3.1"
 BOOKING_SANDBOX_BASE = "https://demandapi-sandbox.booking.com/3.1"
 TRIPADVISOR_BASE = "https://api.content.tripadvisor.com/api/v1"
+FIRECRAWL_BASE = os.getenv("FIRECRAWL_API_BASE", "https://api.firecrawl.dev").rstrip("/")
 DEFAULT_TIMEOUT = float(os.getenv("NOMAD_TRAVEL_TIMEOUT", "25"))
 CACHE_TTL = int(os.getenv("NOMAD_TRAVEL_CACHE_TTL_SECONDS", "900"))
 USER_AGENT = os.getenv(
@@ -76,6 +78,116 @@ def _browser_engine_status() -> dict[str, Any]:
         "browserbase_configured": bool(_env("BROWSERBASE_API_KEY") or _env("BROWSER_USE_API_KEY")),
         "note": "auto tries browser-use CLI when installed; otherwise tools return browser-first task payloads and then static/API fallback results.",
     }
+
+
+def _firecrawl_status() -> dict[str, Any]:
+    return {
+        "configured": bool(_env("FIRECRAWL_API_KEY")),
+        "sdk_available": importlib.util.find_spec("firecrawl") is not None,
+        "api_base": FIRECRAWL_BASE,
+        "strategy": "Firecrawl SDK/API is used before raw static HTTP scraping for public pages when FIRECRAWL_API_KEY is configured.",
+        "mcp_server_note": "You can also install Firecrawl's MCP server in the host AI; this nomad MCP uses Firecrawl directly via SDK/API so it works as a standalone stdio server.",
+    }
+
+
+def _obj_get(obj: Any, key: str, default: Any = None) -> Any:
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    return getattr(obj, key, default)
+
+
+def _firecrawl_normalize_result(raw: Any, url: str) -> dict[str, Any]:
+    data = raw.get("data", raw) if isinstance(raw, dict) else raw
+    metadata = _obj_get(data, "metadata", {}) or {}
+    dump = getattr(metadata, "model_dump", None)
+    if callable(dump):
+        metadata = dump()
+    elif not isinstance(metadata, dict):
+        metadata = dict(metadata) if hasattr(metadata, "__iter__") else {}
+    return {
+        "ok": True,
+        "engine": "firecrawl",
+        "url": _obj_get(metadata, "sourceURL", None) or _obj_get(metadata, "url", None) or url,
+        "markdown": _obj_get(data, "markdown", None) or "",
+        "html": _obj_get(data, "html", None) or _obj_get(data, "rawHtml", None) or "",
+        "metadata": metadata if isinstance(metadata, dict) else {},
+        "warning": _obj_get(data, "warning", None),
+    }
+
+
+async def _firecrawl_scrape_url(url: str, formats: list[str] | None = None, *, only_main_content: bool = True, wait_for_ms: int = 1000) -> dict[str, Any]:
+    api_key = _env("FIRECRAWL_API_KEY")
+    if not api_key:
+        return {"ok": False, "engine": "firecrawl", "configured": False, "error": "FIRECRAWL_API_KEY is not configured"}
+    formats = formats or ["markdown", "html"]
+
+    def sdk_scrape() -> dict[str, Any]:
+        from firecrawl import Firecrawl  # type: ignore
+
+        app = Firecrawl(api_key=api_key)
+        try:
+            raw = app.scrape(
+                url,
+                formats=formats,
+                only_main_content=only_main_content,
+                wait_for=wait_for_ms,
+                timeout=int(DEFAULT_TIMEOUT * 1000),
+                block_ads=True,
+                remove_base64_images=True,
+            )
+        except TypeError:
+            raw = app.scrape(url, formats=formats)
+        result = _firecrawl_normalize_result(raw, url)
+        result["sdk"] = "firecrawl-py"
+        return result
+
+    if importlib.util.find_spec("firecrawl") is not None:
+        try:
+            return await asyncio.to_thread(sdk_scrape)
+        except Exception as exc:
+            sdk_error = str(exc)
+    else:
+        sdk_error = "firecrawl-py SDK is not installed"
+
+    try:
+        async with _client() as client:
+            r = await client.post(
+                f"{FIRECRAWL_BASE}/v2/scrape",
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                json={
+                    "url": url,
+                    "formats": formats,
+                    "onlyMainContent": only_main_content,
+                    "waitFor": wait_for_ms,
+                    "timeout": int(DEFAULT_TIMEOUT * 1000),
+                    "blockAds": True,
+                    "removeBase64Images": True,
+                },
+            )
+            if r.status_code >= 400:
+                return {"ok": False, "engine": "firecrawl", "configured": True, "error": f"HTTP {r.status_code}", "sdk_error": sdk_error}
+            result = _firecrawl_normalize_result(r.json(), url)
+            result["sdk_error"] = sdk_error
+            result["api_endpoint"] = "/v2/scrape"
+            return result
+    except Exception as exc:
+        return {"ok": False, "engine": "firecrawl", "configured": True, "error": str(exc), "sdk_error": sdk_error}
+
+
+def _firecrawl_text(scrape: dict[str, Any]) -> str:
+    return scrape.get("html") or scrape.get("markdown") or ""
+
+
+def _attach_firecrawl_meta(result: dict[str, Any], scrape: dict[str, Any]) -> dict[str, Any]:
+    result["scrape_engine"] = "firecrawl"
+    result["firecrawl"] = {
+        "url": scrape.get("url"),
+        "metadata": scrape.get("metadata", {}),
+        "warning": scrape.get("warning"),
+        "sdk": scrape.get("sdk"),
+        "api_endpoint": scrape.get("api_endpoint"),
+    }
+    return result
 
 
 async def _run_command(args: list[str], timeout: int = 45) -> tuple[int, str, str]:
@@ -412,34 +524,49 @@ def _extract_json_ld(html: str) -> list[dict[str, Any]]:
 async def _scrape_nomads_city(city: str) -> dict[str, Any]:
     slug = re.sub(r"[^a-z0-9]+", "-", city.lower()).strip("-")
     urls = [f"https://nomads.com/{slug}", f"https://nomads.com/cost-of-living/{slug}"]
+
+    async def parse_page(page_text: str, final_url: str, scrape_meta: dict[str, Any] | None = None) -> dict[str, Any]:
+        text = re.sub(r"\s+", " ", page_text)
+        costs = [float(x.replace(",", "")) for x in re.findall(r"\$\s*([0-9][0-9,]{1,6})(?:\s*/\s*mo| per month|/month)?", text)]
+        internet = [float(x) for x in re.findall(r"([0-9]{2,4}(?:\.[0-9]+)?)\s*Mbps", text, re.I)]
+        nomad_cost = None
+        cost_meta = re.search(r'twitter:label2[^>]+value=["\']Nomad Cost[^>]+twitter:data2[^>]+value=["\']\$?([0-9,]+)', text, re.I)
+        if cost_meta:
+            nomad_cost = float(cost_meta.group(1).replace(",", ""))
+        json_ld = _extract_json_ld(page_text)
+        title = re.search(r"<title>(.*?)</title>", page_text, re.I | re.S)
+        plausible_monthly_costs = [x for x in costs if 300 <= x <= 10000]
+        result = {
+            "source": "nomads.com_scrape",
+            "url": final_url,
+            "title": re.sub(r"\s+", " ", title.group(1)).strip() if title else None,
+            "cost_usd_month_candidates": sorted(set(plausible_monthly_costs))[:10],
+            "estimated_cost_usd_month": nomad_cost or (plausible_monthly_costs[0] if plausible_monthly_costs else None),
+            "internet_mbps_candidates": sorted(set(internet), reverse=True)[:5],
+            "estimated_internet_mbps": max(internet) if internet else None,
+            "json_ld_types": [x.get("@type") for x in json_ld if x.get("@type")],
+            "confidence": "medium" if costs or internet else "low",
+            "warning": "Scraped public page; Firecrawl is preferred when configured. Selectors can break and site terms/robots should be respected for production.",
+        }
+        if scrape_meta:
+            _attach_firecrawl_meta(result, scrape_meta)
+        return result
+
+    if _env("FIRECRAWL_API_KEY"):
+        for url in urls:
+            scrape = await _firecrawl_scrape_url(url, formats=["markdown", "html"])
+            if scrape.get("ok") and _firecrawl_text(scrape):
+                result = await parse_page(_firecrawl_text(scrape), scrape.get("url") or url, scrape)
+                if result.get("confidence") != "low":
+                    return result
+
     async with _client() as client:
         for url in urls:
             try:
                 r = await client.get(url)
                 if r.status_code >= 400 or not r.text:
                     continue
-                text = re.sub(r"\s+", " ", r.text)
-                costs = [float(x.replace(",", "")) for x in re.findall(r"\$\s*([0-9][0-9,]{1,6})(?:\s*/\s*mo| per month|/month)?", text)]
-                internet = [float(x) for x in re.findall(r"([0-9]{2,4}(?:\.[0-9]+)?)\s*Mbps", text, re.I)]
-                nomad_cost = None
-                cost_meta = re.search(r'twitter:label2[^>]+value=["\']Nomad Cost[^>]+twitter:data2[^>]+value=["\']\$?([0-9,]+)', text, re.I)
-                if cost_meta:
-                    nomad_cost = float(cost_meta.group(1).replace(",", ""))
-                json_ld = _extract_json_ld(r.text)
-                title = re.search(r"<title>(.*?)</title>", r.text, re.I | re.S)
-                plausible_monthly_costs = [x for x in costs if 300 <= x <= 10000]
-                return {
-                    "source": "nomads.com_scrape",
-                    "url": str(r.url),
-                    "title": re.sub(r"\s+", " ", title.group(1)).strip() if title else None,
-                    "cost_usd_month_candidates": sorted(set(plausible_monthly_costs))[:10],
-                    "estimated_cost_usd_month": nomad_cost or (plausible_monthly_costs[0] if plausible_monthly_costs else None),
-                    "internet_mbps_candidates": sorted(set(internet), reverse=True)[:5],
-                    "estimated_internet_mbps": max(internet) if internet else None,
-                    "json_ld_types": [x.get("@type") for x in json_ld if x.get("@type")],
-                    "confidence": "medium" if costs or internet else "low",
-                    "warning": "Scraped public page; selectors can break and site terms/robots should be respected for production.",
-                }
+                return await parse_page(r.text, str(r.url))
             except Exception:
                 continue
     fallback_url = f"https://nomads.com/{slug}"
@@ -606,8 +733,23 @@ async def _scrape_tripadvisor_public(query_or_url: str, category: str = "Hotels"
     else:
         query = query_or_url
         urls = [f"https://www.tripadvisor.com/Search?q={quote_plus(query_or_url)}&searchSessionId=nomad-travel-planner"]
+    last_error = None
+    if _env("FIRECRAWL_API_KEY"):
+        for url in urls:
+            scrape = await _firecrawl_scrape_url(url, formats=["markdown", "html"])
+            if scrape.get("ok") and _firecrawl_text(scrape):
+                result = _extract_tripadvisor_from_html(_firecrawl_text(scrape), scrape.get("url") or url)
+                result["query"] = query_or_url
+                result["category_hint"] = category
+                _attach_firecrawl_meta(result, scrape)
+                if result.get("confidence") != "low":
+                    return result
+                result["browser_fallback"] = _tripadvisor_browser_fallback(scrape.get("url") or url, query)
+                return result
+            if scrape.get("error"):
+                last_error = f"Firecrawl: {scrape.get('error')}"
+
     async with _client() as client:
-        last_error = None
         for url in urls:
             try:
                 r = await client.get(
@@ -900,6 +1042,14 @@ async def _browser_first_accommodation_site(source: str, city: str, country: str
 
 async def _scrape_public_accommodation_site(source: str, city: str, country: str | None, checkin: str, checkout: str, adults: int, rooms: int, preferences: dict[str, Any]) -> dict[str, Any]:
     url = _build_public_accommodation_url(source, city, country, checkin, checkout, adults, rooms)
+    if _env("FIRECRAWL_API_KEY"):
+        scrape = await _firecrawl_scrape_url(url, formats=["markdown", "html"], wait_for_ms=2500)
+        if scrape.get("ok") and _firecrawl_text(scrape):
+            result = _extract_public_accommodation_from_html(source, _firecrawl_text(scrape), scrape.get("url") or url, preferences)
+            _attach_firecrawl_meta(result, scrape)
+            if result.get("confidence") == "low" and "browser_fallback" not in result:
+                result["browser_fallback"] = _accommodation_browser_fallback(source, scrape.get("url") or url, preferences)
+            return result
     async with _client() as client:
         try:
             r = await client.get(
@@ -1080,6 +1230,14 @@ async def _browser_first_flight_source(source: str, origin_iata: str, destinatio
             "fallback_next": "static_scrape",
         }
     if mode in {"off", "static", "scrape"}:
+        if _env("FIRECRAWL_API_KEY"):
+            scrape = await _firecrawl_scrape_url(url, formats=["markdown", "html"], wait_for_ms=2500)
+            if scrape.get("ok") and _firecrawl_text(scrape):
+                result = _extract_public_flights_from_html(source, _firecrawl_text(scrape), scrape.get("url") or url, currency)
+                _attach_firecrawl_meta(result, scrape)
+                if result.get("confidence") == "low":
+                    result["browser_fallback"] = task_payload
+                return result
         async with _client() as client:
             try:
                 r = await client.get(url, headers={"User-Agent": _env("NOMAD_TRAVEL_BROWSER_UA") or "Mozilla/5.0", "Accept-Language": "en-US,en;q=0.9"})
@@ -1819,12 +1977,26 @@ async def compare_network_school_vs_nomad_base(
 
 
 @mcp.tool()
+async def firecrawl_scrape(url: str, formats: list[str] | None = None, only_main_content: bool = True, wait_for_ms: int = 1000) -> dict[str, Any]:
+    """Scrape a public URL with Firecrawl SDK/API and return markdown/html metadata without exposing credentials."""
+    if not (url.startswith("http://") or url.startswith("https://")):
+        return {"ok": False, "engine": "firecrawl", "error": "url must start with http:// or https://"}
+    result = await _firecrawl_scrape_url(url, formats=formats or ["markdown", "html"], only_main_content=only_main_content, wait_for_ms=wait_for_ms)
+    if result.get("markdown") and len(result["markdown"]) > 12000:
+        result["markdown"] = result["markdown"][:12000] + "\n\n[truncated]"
+    if result.get("html") and len(result["html"]) > 12000:
+        result["html"] = result["html"][:12000] + "\n\n[truncated]"
+    return result
+
+
+@mcp.tool()
 async def provider_status() -> dict[str, Any]:
     """Show which travel data providers are configured, without revealing secrets."""
     return {
         "amadeus": bool(_env("AMADEUS_CLIENT_ID") and _env("AMADEUS_CLIENT_SECRET")),
         "booking_com": bool(_env("BOOKING_API_TOKEN") and _env("BOOKING_AFFILIATE_ID")),
         "tripadvisor": bool(_env("TRIPADVISOR_API_KEY")),
+        "firecrawl": _firecrawl_status(),
         "tripadvisor_public_scrape": True,
         "nomads_com_scrape": True,
         "browser_fallback_protocol": True,
