@@ -1976,9 +1976,13 @@ async def compare_network_school_vs_nomad_base(
     return _cache_set(key, response)
 
 
-@mcp.tool()
 async def firecrawl_scrape(url: str, formats: list[str] | None = None, only_main_content: bool = True, wait_for_ms: int = 1000) -> dict[str, Any]:
-    """Scrape a public URL with Firecrawl SDK/API and return markdown/html metadata without exposing credentials."""
+    """Internal nomad-travel helper for tests and higher-level travel tools.
+
+    Intentionally not registered as an MCP tool: general web scraping must use
+    Hermes' native Firecrawl/web tools, while this server's public MCP surface
+    stays travel-specific (flights, accommodation, city signals, itinerary).
+    """
     if not (url.startswith("http://") or url.startswith("https://")):
         return {"ok": False, "engine": "firecrawl", "error": "url must start with http:// or https://"}
     result = await _firecrawl_scrape_url(url, formats=formats or ["markdown", "html"], only_main_content=only_main_content, wait_for_ms=wait_for_ms)

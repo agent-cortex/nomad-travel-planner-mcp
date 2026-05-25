@@ -2,6 +2,7 @@ import asyncio
 import os
 
 from nomad_travel_mcp.server import (
+    mcp,
     nomad_city_signals,
     provider_status,
     search_accommodations_multi_source,
@@ -120,6 +121,14 @@ def test_firecrawl_scrape_unconfigured_safe():
     assert result["ok"] is False
     assert result["engine"] == "firecrawl"
     assert "FIRECRAWL_API_KEY" in result["error"]
+
+
+def test_firecrawl_scrape_is_internal_not_public_mcp_tool():
+    tools = asyncio.run(mcp.list_tools())
+    tool_names = {tool.name for tool in tools}
+    assert "firecrawl_scrape" not in tool_names
+    assert "search_flights" in tool_names
+    assert "plan_nomad_itinerary" in tool_names
 
 
 def test_network_school_comparison_task_mode():
